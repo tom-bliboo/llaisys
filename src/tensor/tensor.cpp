@@ -3,6 +3,7 @@
 #include "../utils.hpp"
 
 #include <cstring>
+#include <limits>
 #include <numeric>
 #include <sstream>
 
@@ -164,27 +165,124 @@ void Tensor::debug() const {
 }
 
 bool Tensor::isContiguous() const {
-    TO_BE_IMPLEMENTED();
+    if (this->numel() == 0) {
+        return true;
+    }
+
+    ptrdiff_t expected_stride = 1;
+    for (size_t i = this->ndim(); i > 0; --i) {
+        const size_t dim = i - 1;
+        if (_meta.shape[dim] == 1) {
+            continue;
+        }
+        if (_meta.strides[dim] != expected_stride) {
+            return false;
+        }
+        expected_stride *= static_cast<ptrdiff_t>(_meta.shape[dim]);
+    }
     return true;
 }
 
 tensor_t Tensor::permute(const std::vector<size_t> &order) const {
-    TO_BE_IMPLEMENTED();
-    return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+    CHECK_ARGUMENT(order.size() == this->ndim(), "Permutation must contain one entry per dimension");
+
+    TensorMeta meta{this->dtype(), std::vector<size_t>(this->ndim()), std::vector<ptrdiff_t>(this->ndim())};
+    std::vector<bool> seen(this->ndim(), false);
+    for (size_t i = 0; i < order.size(); ++i) {
+        const size_t dim = order[i];
+        CHECK_ARGUMENT(dim < this->ndim(), "Permutation dimension is out of range");
+        CHECK_ARGUMENT(!seen[dim], "Permutation dimensions must be unique");
+        seen[dim] = true;
+        meta.shape[i] = _meta.shape[dim];
+        meta.strides[i] = _meta.strides[dim];
+    }
+
+    return std::shared_ptr<Tensor>(new Tensor(std::move(meta), _storage, _offset));
 }
 
 tensor_t Tensor::view(const std::vector<size_t> &shape) const {
-    TO_BE_IMPLEMENTED();
-    return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+    size_t view_numel = 1;
+    for (const size_t dim : shape) {
+        CHECK_ARGUMENT(
+            dim == 0 || view_numel <= std::numeric_limits<size_t>::max() / dim,
+            "View shape is too large");
+        view_numel *= dim;
+    }
+    CHECK_ARGUMENT(view_numel == this->numel(), "View shape must preserve the number of elements");
+
+    std::vector<ptrdiff_t> view_strides(shape.size());
+    if (this->numel() == 0 && shape == _meta.shape) {
+        view_strides = _meta.strides;
+    } else if (this->numel() == 0 || this->ndim() == 0) {
+        ptrdiff_t stride = 1;
+        for (size_t i = shape.size(); i > 0; --i) {
+            view_strides[i - 1] = stride;
+            stride *= static_cast<ptrdiff_t>(shape[i - 1]);
+        }
+    } else {
+        ptrdiff_t view_dim = static_cast<ptrdiff_t>(shape.size()) - 1;
+        ptrdiff_t chunk_base_stride = _meta.strides.back();
+        size_t tensor_chunk_numel = 1;
+        size_t view_chunk_numel = 1;
+
+        for (size_t i = this->ndim(); i > 0; --i) {
+            const size_t tensor_dim = i - 1;
+            tensor_chunk_numel *= _meta.shape[tensor_dim];
+
+            const bool chunk_end = tensor_dim == 0
+                || (_meta.shape[tensor_dim - 1] != 1
+                    && _meta.strides[tensor_dim - 1]
+                        != static_cast<ptrdiff_t>(tensor_chunk_numel) * chunk_base_stride);
+            if (!chunk_end) {
+                continue;
+            }
+
+            while (view_dim >= 0
+                   && (view_chunk_numel < tensor_chunk_numel
+                       || shape[static_cast<size_t>(view_dim)] == 1)) {
+                view_strides[static_cast<size_t>(view_dim)]
+                    = static_cast<ptrdiff_t>(view_chunk_numel) * chunk_base_stride;
+                view_chunk_numel *= shape[static_cast<size_t>(view_dim)];
+                --view_dim;
+            }
+            CHECK_ARGUMENT(view_chunk_numel == tensor_chunk_numel, "View shape is incompatible with tensor strides");
+
+            if (tensor_dim > 0) {
+                chunk_base_stride = _meta.strides[tensor_dim - 1];
+                tensor_chunk_numel = 1;
+                view_chunk_numel = 1;
+            }
+        }
+        CHECK_ARGUMENT(view_dim == -1, "View shape is incompatible with tensor strides");
+    }
+
+    TensorMeta meta{this->dtype(), shape, std::move(view_strides)};
+    return std::shared_ptr<Tensor>(new Tensor(std::move(meta), _storage, _offset));
 }
 
 tensor_t Tensor::slice(size_t dim, size_t start, size_t end) const {
-    TO_BE_IMPLEMENTED();
-    return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+    CHECK_ARGUMENT(dim < this->ndim(), "Slice dimension is out of range");
+    CHECK_ARGUMENT(start <= end, "Slice start must not exceed end");
+    CHECK_ARGUMENT(end <= _meta.shape[dim], "Slice end is out of range");
+    CHECK_ARGUMENT(_meta.strides[dim] >= 0, "Negative strides are not supported");
+
+    TensorMeta meta = _meta;
+    meta.shape[dim] = end - start;
+    const size_t offset = _offset
+        + start * static_cast<size_t>(_meta.strides[dim]) * this->elementSize();
+    return std::shared_ptr<Tensor>(new Tensor(std::move(meta), _storage, offset));
 }
 
 void Tensor::load(const void *src_) {
-    TO_BE_IMPLEMENTED();
+    const size_t size = this->numel() * this->elementSize();
+    CHECK_ARGUMENT(src_ != nullptr || size == 0, "Source data must not be null");
+    if (size == 0) {
+        return;
+    }
+
+    core::context().setDevice(this->deviceType(), this->deviceId());
+    const llaisysMemcpyKind_t kind = _storage->isHost() ? LLAISYS_MEMCPY_H2H : LLAISYS_MEMCPY_H2D;
+    core::context().runtime().api()->memcpy_sync(this->data(), src_, size, kind);
 }
 
 tensor_t Tensor::contiguous() const {
